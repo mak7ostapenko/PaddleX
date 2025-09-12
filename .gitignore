@@ -1,4 +1,5 @@
-# Paddle套件仓库
+output
+checkpoints/
 paddlex/repo_manager/repos/*
 
 # paddlemodel

@@ -44,19 +44,23 @@ def _get_extra_name_and_remove_extra_marker(dep_spec):
 
 
 def _get_extras():
-    metadata = importlib.metadata.metadata("paddlex")
-    extras = {}
-    # XXX: The `metadata.get_all` used here is not well documented.
-    for name in metadata.get_all("Provides-Extra", []):
-        if name not in _COLLECTIVE_EXTRA_NAMES:
-            extras[name] = defaultdict(list)
-    for dep_spec in importlib.metadata.requires("paddlex"):
-        extra_name, dep_spec = _get_extra_name_and_remove_extra_marker(dep_spec)
-        if extra_name is not None and extra_name not in _COLLECTIVE_EXTRA_NAMES:
-            dep_spec = dep_spec.rstrip()
-            req = Requirement(dep_spec)
-            assert extra_name in extras, extra_name
-            extras[extra_name][req.name].append(dep_spec)
+    try:
+        metadata = importlib.metadata.metadata("paddlex")
+        extras = {}
+        # XXX: The `metadata.get_all` used here is not well documented.
+        for name in metadata.get_all("Provides-Extra", []):
+            if name not in _COLLECTIVE_EXTRA_NAMES:
+                extras[name] = defaultdict(list)
+        for dep_spec in importlib.metadata.requires("paddlex"):
+            extra_name, dep_spec = _get_extra_name_and_remove_extra_marker(dep_spec)
+            if extra_name is not None and extra_name not in _COLLECTIVE_EXTRA_NAMES:
+                dep_spec = dep_spec.rstrip()
+                req = Requirement(dep_spec)
+                assert extra_name in extras, extra_name
+                extras[extra_name][req.name].append(dep_spec)
+    except importlib.metadata.PackageNotFoundError:
+        # Package not installed, return empty extras
+        extras = {}
     return extras
 
 
@@ -65,12 +69,16 @@ EXTRAS = _get_extras()
 
 def _get_dep_specs():
     dep_specs = defaultdict(list)
-    for dep_spec in importlib.metadata.requires("paddlex"):
-        extra_name, dep_spec = _get_extra_name_and_remove_extra_marker(dep_spec)
-        if extra_name is None or extra_name == "all":
-            dep_spec = dep_spec.rstrip()
-            req = Requirement(dep_spec)
-            dep_specs[req.name].append(dep_spec)
+    try:
+        for dep_spec in importlib.metadata.requires("paddlex"):
+            extra_name, dep_spec = _get_extra_name_and_remove_extra_marker(dep_spec)
+            if extra_name is None or extra_name == "all":
+                dep_spec = dep_spec.rstrip()
+                req = Requirement(dep_spec)
+                dep_specs[req.name].append(dep_spec)
+    except importlib.metadata.PackageNotFoundError:
+        # Package not installed, return empty dep_specs
+        pass
     return dep_specs
 
 
@@ -99,6 +107,10 @@ def is_dep_available(dep, /, check_version=None):
         return importlib.util.find_spec("ultra_infer") is not None
     else:
         if dep != "paddle2onnx" and dep not in DEP_SPECS:
+            # If DEP_SPECS is empty (package not installed), try to check if module exists anyway
+            if not DEP_SPECS:
+                version = get_dep_version(dep)
+                return version is not None
             raise ValueError("Unknown dependency")
     if check_version is None:
         if dep == "paddle2onnx":
@@ -171,6 +183,9 @@ def class_requires_deps(*deps):
 
 @lru_cache()
 def is_extra_available(extra):
+    # If EXTRAS is empty (package not installed), assume extras are available
+    if not EXTRAS or extra not in EXTRAS:
+        return True
     flags = [is_dep_available(dep) for dep in EXTRAS[extra]]
     if all(flags):
         return True

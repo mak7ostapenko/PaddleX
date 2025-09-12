@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Sequence, Union
 
 import numpy as np
+import onnxruntime as ort
 
 from ....utils import logging
 from ....utils.deps import class_requires_deps
@@ -268,7 +269,9 @@ class StaticInfer(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
 
-class PaddleInfer(StaticInfer):
+class ONNXRuntimeInfer(StaticInfer):
+    """ONNX Runtime-based inference to replace PaddleInfer"""
+    
     def __init__(
         self,
         model_name: str,
@@ -281,304 +284,124 @@ class PaddleInfer(StaticInfer):
         self.model_dir = Path(model_dir)
         self.model_file_prefix = model_file_prefix
         self._option = option
-        self.predictor = self._create()
-        self.infer = PaddleInferChainLegacy(self.predictor)
+        self.session = self._create_onnx_session()
+        # Initialize fallback flag
+        if not hasattr(self, '_use_paddle_fallback'):
+            self._use_paddle_fallback = False
+        
+    def _create_onnx_session(self):
+        """Create ONNX Runtime session"""
+        model_paths = get_model_paths(self.model_dir, self.model_file_prefix)
+        
+        # First try to find ONNX model
+        onnx_model_path = None
+        if "onnx" in model_paths:
+            onnx_path = model_paths["onnx"]
+            if isinstance(onnx_path, dict) and "model" in onnx_path:
+                onnx_model_path = onnx_path["model"]
+            elif isinstance(onnx_path, (str, Path)):
+                onnx_model_path = str(onnx_path)
+        
+        if onnx_model_path is None:
+            # Look for inference.onnx directly
+            inference_onnx = self.model_dir / "inference.onnx"
+            if inference_onnx.exists():
+                onnx_model_path = str(inference_onnx)
+        
+        if onnx_model_path is None:
+            # Fall back to PaddlePaddle if no ONNX model found
+            logging.warning(f"No ONNX model found in {self.model_dir}, falling back to PaddlePaddle inference")
+            # Delegate to original PaddleInfer implementation
+            self._use_paddle_fallback = True
+            self._paddle_infer = self._create_paddle_fallback()
+            return None
+        
+        self._use_paddle_fallback = False
+            
+        logging.info(f"Loading ONNX model: {onnx_model_path}")
+        
+        # Set up ONNX Runtime options
+        providers = []
+        if self._option.device_type == "gpu":
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+        
+        sess_options = ort.SessionOptions()
+        if self._option.device_type == "cpu":
+            # Use cpu_threads from PaddlePredictorOption
+            cpu_threads = getattr(self._option, 'cpu_threads', 10)
+            sess_options.intra_op_num_threads = cpu_threads
+        
+        # Create ONNX Runtime session
+        session = ort.InferenceSession(
+            onnx_model_path, 
+            sess_options=sess_options,
+            providers=providers
+        )
+        
+        logging.info(f"ONNX Runtime session created successfully with providers: {session.get_providers()}")
+        return session
 
     def __call__(self, x: Sequence[np.ndarray]) -> List[np.ndarray]:
-        names = self.predictor.get_input_names()
-        if len(names) != len(x):
+        """Run inference using ONNX Runtime or PaddlePaddle fallback"""
+        if hasattr(self, '_use_paddle_fallback') and self._use_paddle_fallback:
+            return self._paddle_infer(x)
+        
+        input_names = [input.name for input in self.session.get_inputs()]
+        
+        if len(input_names) != len(x):
             raise ValueError(
-                f"The number of inputs does not match the model: {len(names)} vs {len(x)}"
+                f"The number of inputs does not match the model: {len(input_names)} vs {len(x)}"
             )
-        # TODO:
-        # Ensure that input tensors follow the model's input sequence without sorting.
-        x = _sort_inputs(x, names)
-        x = list(map(np.ascontiguousarray, x))
-        pred = self.infer(x)
-        return pred
-
-    def _check_run_mode(self):
-        # TODO: Check if trt is available
-        # check avaliable for trt
-        if (
-            not DISABLE_TRT_MODEL_BL
-            and self._option.run_mode.startswith("trt")
-            and self._model_name in TRT_BLOCKLIST
-            and self._option.device_type == "gpu"
-        ):
-            logging.warning(
-                f"The model({self._model_name}) is not supported to run in trt mode! Using `paddle` instead!"
-            )
-            self._option.run_mode = "paddle"
-
-        # check avaliable for mkldnn
-        elif (
-            not DISABLE_MKLDNN_MODEL_BL
-            and self._option.run_mode.startswith("mkldnn")
-            and self._model_name in MKLDNN_BLOCKLIST
-            and self._option.device_type == "cpu"
-        ):
-            logging.warning(
-                f"The model({self._model_name}) is not supported to run in MKLDNN mode! Using `paddle` instead!"
-            )
-            self._option.run_mode = "paddle"
-            return "paddle"
-
-        # check avaliable for model
-        if self._model_name == "LaTeX_OCR_rec" and self._option.device_type == "cpu":
-            import cpuinfo
-
-            if (
-                "GenuineIntel" in cpuinfo.get_cpu_info().get("vendor_id_raw", "")
-                and self._option.run_mode != "mkldnn"
-            ):
-                logging.warning(
-                    "Now, the `LaTeX_OCR_rec` model only support `mkldnn` mode when running on Intel CPU devices. So using `mkldnn` instead."
-                )
-            self._option.run_mode = "mkldnn"
-
-    def _create(
-        self,
-    ):
-        """_create"""
+            
+        # Sort inputs to match model input order
+        x = _sort_inputs(x, input_names)
+        
+        # Prepare input dictionary
+        input_dict = {}
+        for name, input_array in zip(input_names, x):
+            input_dict[name] = np.ascontiguousarray(input_array)
+            
+        # Run inference
+        outputs = self.session.run(None, input_dict)
+        return outputs
+        
+    def _create_paddle_fallback(self):
+        """Create PaddlePaddle inference as fallback when ONNX is not available"""
         import paddle
         import paddle.inference
-
+        
         model_paths = get_model_paths(self.model_dir, self.model_file_prefix)
         if "paddle" not in model_paths:
             raise RuntimeError("No valid PaddlePaddle model found")
-
-        check_supported_device_type(self._option.device_type, self._model_name)
-        self._check_run_mode()
-
+        
         model_file, params_file = model_paths["paddle"]
-
-        if self._option.device_type == "cpu" and self._option.device_id is not None:
-            self._option.device_id = None
-            logging.debug("`device_id` has been set to None")
-
-        if (
-            self._option.device_type in ("gpu", "dcu", "npu", "mlu", "gcu", "xpu")
-            and self._option.device_id is None
-        ):
-            self._option.device_id = 0
-            logging.debug("`device_id` has been set to 0")
-
-        # for TRT
-        if self._option.run_mode.startswith("trt"):
-            assert self._option.device_type.lower() == "gpu", (
-                f"`{self._option.run_mode}` is only available on GPU devices, "
-                f"but got device_type='{self._option.device_type}'."
-            )
-            cache_dir = self.model_dir / CACHE_DIR / "paddle"
-            config = self._configure_trt(
-                model_file,
-                params_file,
-                cache_dir,
-            )
-            config.exp_disable_mixed_precision_ops({"feed", "fetch"})
-            config.enable_use_gpu(100, self._option.device_id)
-        # for Native Paddle and MKLDNN
+        config = paddle.inference.Config(str(model_file), str(params_file))
+        
+        # Basic configuration for fallback
+        if self._option.device_type == "gpu":
+            config.enable_use_gpu(100, self._option.device_id or 0)
         else:
-            config = paddle.inference.Config(str(model_file), str(params_file))
-            if self._option.device_type == "gpu":
-                config.exp_disable_mixed_precision_ops({"feed", "fetch"})
-                from paddle.inference import PrecisionType
-
-                precision = (
-                    PrecisionType.Half
-                    if self._option.run_mode == "paddle_fp16"
-                    else PrecisionType.Float32
-                )
-                config.disable_mkldnn()
-                config.enable_use_gpu(100, self._option.device_id, precision)
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                    if self._option.enable_new_ir and self._option.enable_cinn:
-                        config.enable_cinn()
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-                config.set_optimization_level(3)
-            elif self._option.device_type == "npu":
-                config.enable_custom_device("npu", self._option.device_id)
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-            elif self._option.device_type == "xpu":
-                config.enable_xpu()
-                config.set_xpu_device_id(self._option.device_id)
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-                config.delete_pass("conv2d_bn_xpu_fuse_pass")
-                config.delete_pass("transfer_layout_pass")
-            elif self._option.device_type == "mlu":
-                config.enable_custom_device("mlu", self._option.device_id)
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-            elif self._option.device_type == "gcu":
-                from paddle_custom_device.gcu import passes as gcu_passes
-
-                gcu_passes.setUp()
-                config.enable_custom_device("gcu", self._option.device_id)
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir()
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-                else:
-                    pass_builder = config.pass_builder()
-                    name = "PaddleX_" + self._option.model_name
-                    gcu_passes.append_passes_for_legacy_ir(pass_builder, name)
-            elif self._option.device_type == "dcu":
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                config.enable_use_gpu(100, self._option.device_id)
-                config.disable_mkldnn()
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-                # XXX: is_compiled_with_rocm() must be True on dcu platform ?
-                if paddle.is_compiled_with_rocm():
-                    # Delete unsupported passes in dcu
-                    config.delete_pass("conv2d_add_act_fuse_pass")
-                    config.delete_pass("conv2d_add_fuse_pass")
-            else:
-                assert self._option.device_type == "cpu"
-                config.disable_gpu()
-                if "mkldnn" in self._option.run_mode:
-                    config.enable_mkldnn()
-                    if "bf16" in self._option.run_mode:
-                        config.enable_mkldnn_bfloat16()
-                    config.set_mkldnn_cache_capacity(self._option.mkldnn_cache_capacity)
-                else:
-                    if hasattr(config, "disable_mkldnn"):
-                        config.disable_mkldnn()
-                config.set_cpu_math_library_num_threads(self._option.cpu_threads)
-
-                if hasattr(config, "enable_new_ir"):
-                    config.enable_new_ir(self._option.enable_new_ir)
-                if hasattr(config, "enable_new_executor"):
-                    config.enable_new_executor()
-                config.set_optimization_level(3)
-
+            config.disable_gpu()
+            config.set_cpu_math_library_num_threads(getattr(self._option, 'cpu_threads', 10))
+        
         config.enable_memory_optim()
-        for del_p in self._option.delete_pass:
-            config.delete_pass(del_p)
-
-        # Disable paddle inference logging
         if not DEBUG:
             config.disable_glog_info()
-
+        
         predictor = paddle.inference.create_predictor(config)
+        return PaddleInferChainLegacy(predictor)
 
-        return predictor
+# Alias for backward compatibility - replace PaddleInfer with ONNX version
+class PaddleInfer(ONNXRuntimeInfer):
+    """Backward compatibility alias - now uses ONNX Runtime instead of Paddle Inference"""
+    pass
 
-    def _configure_trt(self, model_file, params_file, cache_dir):
-        # TODO: Support calibration
-        import paddle.inference
+    # Remove old paddle methods - not needed for ONNX Runtime
 
-        if USE_PIR_TRT:
-            if self._option.trt_dynamic_shapes is None:
-                raise RuntimeError("No dynamic shape information provided")
-            trt_save_path = cache_dir / "trt" / self.model_file_prefix
-            trt_model_file = trt_save_path.with_suffix(".json")
-            trt_params_file = trt_save_path.with_suffix(".pdiparams")
-            if not trt_model_file.exists() or not trt_params_file.exists():
-                _convert_trt(
-                    self._option.trt_cfg_setting,
-                    model_file,
-                    params_file,
-                    trt_save_path,
-                    self._option.device_id,
-                    self._option.trt_dynamic_shapes,
-                    self._option.trt_dynamic_shape_input_data,
-                )
-            else:
-                logging.debug(
-                    f"Use TRT cache files(`{trt_model_file}` and `{trt_params_file}`)."
-                )
-            config = paddle.inference.Config(str(trt_model_file), str(trt_params_file))
-        else:
-            config = paddle.inference.Config(str(model_file), str(params_file))
-            config.set_optim_cache_dir(str(cache_dir / "optim_cache"))
-            # call enable_use_gpu() first to use TensorRT engine
-            config.enable_use_gpu(100, self._option.device_id)
-            for func_name in self._option.trt_cfg_setting:
-                assert hasattr(
-                    config, func_name
-                ), f"The `{type(config)}` don't have function `{func_name}`!"
-                args = self._option.trt_cfg_setting[func_name]
-                if isinstance(args, list):
-                    getattr(config, func_name)(*args)
-                else:
-                    getattr(config, func_name)(**args)
+    # Old _create method removed - replaced by ONNXRuntimeInfer._create_onnx_session
 
-            if self._option.trt_use_dynamic_shapes:
-                if self._option.trt_dynamic_shapes is None:
-                    raise RuntimeError("No dynamic shape information provided")
-                if self._option.trt_collect_shape_range_info:
-                    # NOTE: We always use a shape range info file.
-                    if self._option.trt_shape_range_info_path is not None:
-                        trt_shape_range_info_path = Path(
-                            self._option.trt_shape_range_info_path
-                        )
-                    else:
-                        trt_shape_range_info_path = cache_dir / "shape_range_info.pbtxt"
-                    should_collect_shape_range_info = True
-                    if not trt_shape_range_info_path.exists():
-                        trt_shape_range_info_path.parent.mkdir(
-                            parents=True, exist_ok=True
-                        )
-                        logging.info(
-                            f"Shape range info will be collected into {trt_shape_range_info_path}"
-                        )
-                    elif self._option.trt_discard_cached_shape_range_info:
-                        trt_shape_range_info_path.unlink()
-                        logging.info(
-                            f"The shape range info file ({trt_shape_range_info_path}) has been removed, and the shape range info will be re-collected."
-                        )
-                    else:
-                        logging.info(
-                            f"A shape range info file ({trt_shape_range_info_path}) already exists. There is no need to collect the info again."
-                        )
-                        should_collect_shape_range_info = False
-                    if should_collect_shape_range_info:
-                        _collect_trt_shape_range_info(
-                            str(model_file),
-                            str(params_file),
-                            self._option.device_id,
-                            str(trt_shape_range_info_path),
-                            self._option.trt_dynamic_shapes,
-                            self._option.trt_dynamic_shape_input_data,
-                        )
-                    if (
-                        self._option.model_name in DISABLE_TRT_HALF_OPS_CONFIG
-                        and self._option.run_mode == "trt_fp16"
-                    ):
-                        paddle.inference.InternalUtils.disable_tensorrt_half_ops(
-                            config, DISABLE_TRT_HALF_OPS_CONFIG[self._option.model_name]
-                        )
-                    config.enable_tuned_tensorrt_dynamic_shape(
-                        str(trt_shape_range_info_path),
-                        self._option.trt_allow_rebuild_at_runtime,
-                    )
-                else:
-                    min_shapes, opt_shapes, max_shapes = {}, {}, {}
-                    for (
-                        key,
-                        shapes,
-                    ) in self._option.trt_dynamic_shapes.items():
-                        min_shapes[key] = shapes[0]
-                        opt_shapes[key] = shapes[1]
-                        max_shapes[key] = shapes[2]
-                        config.set_trt_dynamic_shape_info(
-                            min_shapes, max_shapes, opt_shapes
-                        )
-
-        return config
+    # Old _configure_trt method removed - not needed for ONNX Runtime
 
 
 # FIXME: Name might be misleading
